@@ -155,16 +155,28 @@ end
 ---@return neotest.Tree
 DotnetNeotestAdapter.discover_positions = function(path)
 	local bufnr = find_buffer_by_name(path)
-	local tests = DotnetNeoTestOmnisharp.discover_tests(nil, path, bufnr)
-	-- filter tests to only include tests that are in the file
-	tests = vim.tbl_filter(function(test)
-		return test.CodeFilePath == path
-	end, tests)
+
+	-- wait for omnisharp to be ready
+	local attempts = 0
+	local client = nil
+	while client == nil do
+		client = DotnetNeoTestOmnisharp.get_client(bufnr)
+		if client ~= nil then
+			break
+		end
+
+		if attempts > 20 then
+			break
+		end
+
+		nio.sleep(1000)
+	end
+
+	local tests = DotnetNeoTestOmnisharp.discover_tests(client, path, bufnr)
 	if #tests > 0 then
 		vim.defer_fn(function()
 			vim.notify("using omnisharp")
 		end, 0)
-		local result = {}
 
 		-- foreach test in tests
 		--- @type IntermediateTree
@@ -174,10 +186,9 @@ DotnetNeotestAdapter.discover_positions = function(path)
 			print("test: " .. vim.inspect(test))
 			local fully_qualified_name_parts = vim.split(test.FullyQualifiedName, ".",
 				{ plain = true, trimempty = true })
-			table.insert(fully_qualified_name_parts, 1, test.CodeFilePath)
 			print("fully_qualified_name_parts: " .. vim.inspect(fully_qualified_name_parts))
 			local parent = tree
-			for i, part in ipairs(fully_qualified_name_parts) do
+			for _, part in ipairs(fully_qualified_name_parts) do
 				local found = false
 				for _, child in ipairs(parent.children) do
 					if type(child) == "table" and child.name == part then
@@ -195,37 +206,103 @@ DotnetNeotestAdapter.discover_positions = function(path)
 			end
 			table.insert(parent.children, test)
 		end
+		print("tree: " .. vim.inspect(tree))
 
-		---@param subtree IntermediateTree | dotnetneotest.omnisharp.test
-		local function build_children(parent, subtree)
-			if not subtree.children then
-				local test = subtree
-				local position = {
-					type = "test",
-					name = test.DisplayName,
-					path = test.CodeFilePath,
-					id = parent.path .. "::" .. test.DisplayName,
-					running_id = parent.path .. "::" .. test.DisplayName,
-					framework = "vstest"
-				}
-				return { position }
-			else
-				if #subtree.children == 1 then
-					return build_children(parent, subtree.children[1])
+		local code_structures = {}
+
+		---@param path string
+		local function find_code_structure(path)
+			if code_structures[path] ~= nil then
+				return code_structures[path]
+			end
+
+
+			local err, res = client.request["o#_v2_codestructure"]({
+				filename = path
+			}, bufnr)
+			code_structures[path] = res
+			logger.debug("neotest-dotnet: found code structure: " .. vim.inspect(res))
+			return res
+		end
+
+		local function find_symbol(path, symbol_name, is_test)
+			local code_structure = find_code_structure(path)
+			local to_consider = {}
+			for _, value in ipairs(code_structure.Elements) do
+				table.insert(to_consider, value)
+			end
+
+			while #to_consider > 0 do
+				local item = table.remove(to_consider)
+
+				local target_name
+				if is_test then
+					target_name = item.Properties and item.Properties.testMethodName
+				else
+					target_name = item.Name
 				end
 
+				if target_name == symbol_name then
+					local ranges = item.Ranges.full
+					local range = {ranges.Start.Line, ranges.Start.Column, ranges.End.Line, ranges.End.Column}
+					return { range = range, type = "namespace", symbol_kind = item.Kind }
+				end
+
+				local children = item.Children or {}
+				for _, value in ipairs(children) do
+					table.insert(to_consider, value)
+				end
+			end
+
+			logger.debug("neotest-dotnet: could not find method range for " .. symbol_name)
+			return {type = "namespace", range = {1, 1,1, 1}}
+		end
+
+		---@param subtree IntermediateTree | dotnetneotest.omnisharp.test
+		local function build_children(context, parent, subtree)
+			if not subtree.children then
+				local symbol = find_symbol(subtree.CodeFilePath, subtree.FullyQualifiedName, true)
+				---@cast subtree dotnetneotest.omnisharp.test
+				local test = subtree
+				local args_start = string.find(test.DisplayName, "(", nil, true)
+				local args = ""
+				if args_start ~= nil then
+					args = string.sub(test.DisplayName, args_start)
+				end
+				print("args: " .. args)
+				local name_parts = vim.split(test.DisplayName, ".", { plain = true, trimempty = true })
+				local name = name_parts[#name_parts]
+				local position = {
+					type = "test",
+					name = name,
+					path = test.CodeFilePath,
+					id = context.path .. "::" .. test.DisplayName,
+					running_id = context.path .. "::" .. test.FullyQualifiedName .. args,
+					framework = "vstest",
+					range = symbol.range,
+				}
+				print(position.running_id)
+				return { position }
+			else
+				local symbol = find_symbol(subtree.path, subtree.name)
+
+				if symbol.symbol_kind == "method" and #subtree.children == 1 then
+					return build_children(context, parent, subtree.children[1])
+				end
+
+				--- @type neotest.Position
 				local node = {
-					type = "namespace",
+					type = symbol.type,
 					name = subtree.name,
-					path = subtree.path,
 					id = parent.id .. "::" .. subtree.name,
-					range = { 1, 1, 1, 1 },
+					range = symbol.range,
+					path = subtree.path,
 				}
 
 				local built_children = {}
 				table.insert(built_children, node)
 				for _, child in ipairs(subtree.children) do
-					table.insert(built_children, build_children(node, child))
+					table.insert(built_children, build_children(context, node, child))
 				end
 				return built_children
 			end
@@ -234,21 +311,18 @@ DotnetNeotestAdapter.discover_positions = function(path)
 		logger.debug("neotest-dotnet: omnisharp results tree: " .. vim.inspect(tree))
 
 		local results = {}
-		for _, child in ipairs(tree.children) do
-			--- @type neotest.Position
-			local node = {
-				type = "file",
-				name = vim.fn.fnamemodify(child.path, ':t'),
-				path = child.path,
-				id = child.name,
-				range = { 1, 1, 1, 1 },
+		local project = DotnetNeotestAdapter.root(path)
+			local project_node = {
+				type = "dir",
+				name = vim.fn.fnamemodify(project, ':t') .. ".csproj",
+				path = project .. ".csproj",
+				id = project,
 			}
-			table.insert(results, node)
-
-			for _, innerchild in ipairs(child.children) do
-				local built_child = build_children(node, innerchild)
-				table.insert(results, built_child)
-			end
+			table.insert(results, project_node)
+		for _, child in ipairs(tree.children) do
+			local context = {path = path, project = project}
+			local built_child = build_children(context, project_node, child)
+			table.insert(results, built_child)
 		end
 		local neotest_tree = require('neotest.types.tree')
 		logger.debug("neotest-dotnet: omnisharp results transformed: " .. vim.inspect(results))
@@ -275,9 +349,6 @@ DotnetNeotestAdapter.discover_positions = function(path)
 	if true then
 		return {}
 	end
-
-
-
 
 	local content = lib.files.read(path)
 	local test_framework =
@@ -316,6 +387,7 @@ DotnetNeotestAdapter.discover_positions = function(path)
 	logger.debug("neotest-dotnet: Original Position Tree: ")
 	logger.debug(tree:to_list())
 
+	print(vim.inspect(test_framework))
 	local modified_tree = test_framework.post_process_tree_list(tree, path)
 
 	logger.debug("neotest-dotnet: Post-processed Position Tree: ")
@@ -360,6 +432,9 @@ end
 ---@param tree neotest.Tree
 ---@return neotest.Result[]
 DotnetNeotestAdapter.results = function(spec, _, tree)
+	if spec.context == nil then
+		return {}
+	end
 	local output_file = spec.context.results_path
 
 	logger.debug("neotest-dotnet: Fetching results from neotest tree (as list): ")
